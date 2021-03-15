@@ -233,7 +233,7 @@ class TopDownRuleDriver implements RuleDriver {
         }
       }
       if (optimizingGroup == null) {
-        return;
+        optimizingGroup = subset;
       }
       Task task = getOptimizeInputTask(node, optimizingGroup);
       if (task != null) {

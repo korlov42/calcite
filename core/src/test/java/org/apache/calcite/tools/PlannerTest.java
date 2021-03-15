@@ -26,7 +26,9 @@ import org.apache.calcite.adapter.jdbc.JdbcImplementor;
 import org.apache.calcite.adapter.jdbc.JdbcRel;
 import org.apache.calcite.adapter.jdbc.JdbcRules;
 import org.apache.calcite.config.Lex;
+import org.apache.calcite.plan.Convention;
 import org.apache.calcite.plan.ConventionTraitDef;
+import org.apache.calcite.plan.DeriveMode;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.RelOptPredicateList;
@@ -37,15 +39,26 @@ import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelRule;
 import org.apache.calcite.plan.RelTraitDef;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.rel.PhysicalNode;
 import org.apache.calcite.rel.RelCollationTraitDef;
+import org.apache.calcite.rel.RelCollations;
+import org.apache.calcite.rel.RelDistribution;
+import org.apache.calcite.rel.RelDistributionTraitDef;
+import org.apache.calcite.rel.RelDistributions;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
 import org.apache.calcite.rel.convert.ConverterRule;
+import org.apache.calcite.rel.core.Exchange;
+import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.JoinRelType;
+import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.core.RelFactories;
 import org.apache.calcite.rel.core.TableScan;
+import org.apache.calcite.rel.hint.RelHint;
 import org.apache.calcite.rel.logical.LogicalFilter;
+import org.apache.calcite.rel.logical.LogicalJoin;
 import org.apache.calcite.rel.logical.LogicalProject;
+import org.apache.calcite.rel.logical.LogicalTableScan;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.rules.CoreRules;
 import org.apache.calcite.rel.rules.ProjectMergeRule;
@@ -53,6 +66,7 @@ import org.apache.calcite.rel.rules.PruneEmptyRules;
 import org.apache.calcite.rel.rules.UnionMergeRule;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
+import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.schema.SchemaPlus;
 import org.apache.calcite.schema.impl.ScalarFunctionImpl;
 import org.apache.calcite.sql.SqlAggFunction;
@@ -78,12 +92,15 @@ import org.apache.calcite.sql.validate.SqlValidatorScope;
 import org.apache.calcite.test.CalciteAssert;
 import org.apache.calcite.test.RelBuilderTest;
 import org.apache.calcite.util.Optionality;
+import org.apache.calcite.util.Pair;
 import org.apache.calcite.util.Smalls;
 import org.apache.calcite.util.Util;
 
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 
+import org.checkerframework.checker.nullness.qual.Nullable;
 import org.hamcrest.Matcher;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Disabled;
@@ -91,7 +108,11 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 import static org.apache.calcite.test.RelMetadataTest.sortsAs;
 
@@ -102,6 +123,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.core.Is.is;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
@@ -771,6 +793,404 @@ class PlannerTest {
         equalTo(
             "EnumerableProject(empid=[$0], deptno=[$1], name=[$2], salary=[$3], commission=[$4])\n"
             + "  EnumerableTableScan(table=[[hr, emps]])\n"));
+  }
+
+  static class MyConvention extends Convention.Impl {
+    public static final MyConvention INSTANCE = new MyConvention();
+
+    /** */
+    private MyConvention() {
+      super("MY", MyPhysNode.class);
+    }
+
+    /** {@inheritDoc} */
+    @Override public ConventionTraitDef getTraitDef() {
+      return ConventionTraitDef.INSTANCE;
+    }
+
+    @Override public @Nullable RelNode enforce(RelNode input, RelTraitSet required) {
+      RelDistribution requiredDistr = required.getDistribution();
+
+      if (input.getTraitSet().getDistribution().satisfies(requiredDistr))
+        return null;
+
+      return new MyExchange(
+          input.getCluster(),
+          input.getTraitSet().replace(MyConvention.INSTANCE).replace(requiredDistr),
+          RelOptRule.convert(input, input.getTraitSet().replace(RelDistributions.ANY)),
+          requiredDistr
+      );
+    }
+  }
+
+  interface MyPhysNode extends PhysicalNode {
+    @Override default @Nullable Pair<RelTraitSet, List<RelTraitSet>> passThroughTraits(
+        RelTraitSet required) {
+      if (required.getConvention() != MyConvention.INSTANCE)
+        return null;
+
+      List<RelTraitSet> inputs = getInputs().stream()
+          .map(ignored -> required)
+          .collect(Collectors.toList());
+
+      return Pair.of(required, inputs);
+    }
+
+    @Override default List<RelNode> derive(List<List<RelTraitSet>> inputTraits) {
+      return inputTraits.stream()
+          .map(inputs -> inputs.get(0))
+          .filter(
+              inputTraitSet -> inputTraitSet.getConvention() == MyConvention.INSTANCE
+          )
+          .map(
+              inputTraitSet -> copy(inputTraitSet, ImmutableList.of(RelOptRule.convert(getInput(0), inputTraitSet)))
+          )
+          .collect(Collectors.toList());
+    }
+
+    @Override default DeriveMode getDeriveMode() {
+      return DeriveMode.OMAKASE;
+    }
+  }
+
+  static class MyNLJoin extends Join implements MyPhysNode {
+    protected MyNLJoin(RelOptCluster cluster, RelTraitSet traits, RelNode left, RelNode right,
+        RexNode condition) {
+      super(cluster, traits, Collections.emptyList(), left, right, condition, Collections.emptySet(), JoinRelType.INNER);
+    }
+
+    @Override public Join copy(RelTraitSet traitSet, RexNode conditionExpr, RelNode left, RelNode right,
+        JoinRelType joinType, boolean semiJoinDone) {
+      return new MyNLJoin(getCluster(), traitSet, left, right, condition);
+    }
+
+    @Override public List<RelNode> derive(List<List<RelTraitSet>> inputTraits) {
+      List<RelNode> nodes = new ArrayList<>();
+
+      List<Pair<RelTraitSet, RelTraitSet>> pairs = new ArrayList<>();
+
+      for (RelTraitSet left : inputTraits.get(0)) {
+        if (left.getConvention() != MyConvention.INSTANCE)
+          continue;
+
+        for (RelTraitSet right : inputTraits.get(1)) {
+          if (right.getConvention() != MyConvention.INSTANCE)
+            continue;
+
+          pairs.add(Pair.of(left, right));
+        }
+      }
+
+      for (Pair<RelTraitSet, RelTraitSet> pair : pairs) {
+        RelTraitSet leftTraits = pair.left;
+        RelTraitSet rightTraits = pair.right;
+
+        nodes.add(
+            copy(
+                leftTraits,
+                condition,
+                RelOptRule.convert(left, leftTraits.replace(RelDistributions.SINGLETON)),
+                RelOptRule.convert(right, leftTraits.replace(RelDistributions.SINGLETON)),
+                JoinRelType.INNER,
+                isSemiJoinDone()
+            )
+        );
+
+        if (leftTraits.getDistribution().getType() == RelDistribution.Type.HASH_DISTRIBUTED
+            || rightTraits.getDistribution().getType() == RelDistribution.Type.HASH_DISTRIBUTED) {
+          RelDistribution newLeft;
+          RelDistribution newRight;
+
+          if (leftTraits.getDistribution().getType() == RelDistribution.Type.HASH_DISTRIBUTED) {
+            newLeft = leftTraits.getDistribution();
+            newRight = newLeft;
+          }
+          else {
+            newRight = rightTraits.getDistribution();
+            newLeft = newRight;
+          }
+
+          nodes.add(
+              copy(
+                  traitSet.replace(newLeft),
+                  condition,
+                  RelOptRule.convert(left, leftTraits.replace(newLeft)),
+                  RelOptRule.convert(right, rightTraits.replace(newRight)),
+                  JoinRelType.INNER,
+                  isSemiJoinDone()
+              )
+          );
+        }
+      }
+
+      return nodes;
+    }
+  }
+
+  static class MyNLJoinRule extends ConverterRule {
+    protected MyNLJoinRule(Config config) {
+      super(config);
+    }
+
+    @Override public RelNode convert(RelNode rel) {
+      final Join join = (Join) rel;
+      return new MyNLJoin(
+          rel.getCluster(),
+          rel.getTraitSet().replace(MyConvention.INSTANCE),
+          join.getLeft(),
+          join.getRight(),
+          join.getCondition()
+      );
+    }
+  }
+
+  static AtomicBoolean deriveCalled = new AtomicBoolean(false);
+
+  static class MyMergeJoin extends MyNLJoin {
+
+    protected MyMergeJoin(RelOptCluster cluster, RelTraitSet traits, RelNode left, RelNode right,
+        RexNode condition) {
+      super(cluster, traits, left, right, condition);
+    }
+
+    @Override public List<RelNode> derive(List<List<RelTraitSet>> inputTraits) {
+      deriveCalled.set(true);
+
+      List<RelDistribution> distributions = Arrays.asList(RelDistributions.SINGLETON,
+          RelDistributions.BROADCAST_DISTRIBUTED, RelDistributions.hash(ImmutableSet.of(0)));
+
+      List<RelNode> nodes = new ArrayList<>();
+
+      inputTraits.stream()
+          .filter(traits -> traits.stream().allMatch(t -> t.getConvention() == MyConvention.INSTANCE))
+          .forEach(traits -> {
+            RelTraitSet leftTraits = traits.get(0);
+            RelTraitSet rightTraits = traits.get(1);
+
+            nodes.add(
+                copy(
+                    traitSet.replace(leftTraits.getTrait(RelDistributionTraitDef.INSTANCE)),
+                    condition,
+                    left.copy(leftTraits.replace(RelDistributions.SINGLETON), left.getInputs()),
+                    right.copy(rightTraits.replace(RelDistributions.SINGLETON), right.getInputs()),
+                    JoinRelType.INNER,
+                    isSemiJoinDone()
+                )
+            );
+
+            if (leftTraits.getDistribution().getType() == RelDistribution.Type.HASH_DISTRIBUTED
+                || rightTraits.getDistribution().getType() == RelDistribution.Type.HASH_DISTRIBUTED) {
+              RelDistribution newLeft;
+              RelDistribution newRight;
+
+              if (leftTraits.getDistribution().getType() == RelDistribution.Type.HASH_DISTRIBUTED) {
+                newLeft = leftTraits.getDistribution();
+                newRight = newLeft;
+              }
+              else {
+                newRight = rightTraits.getDistribution();
+                newLeft = newRight;
+              }
+
+              nodes.add(
+                  copy(
+                      traitSet.replace(newLeft),
+                      condition,
+                      left.copy(leftTraits.replace(newLeft), left.getInputs()),
+                      right.copy(rightTraits.replace(newRight), right.getInputs()),
+                      JoinRelType.INNER,
+                      isSemiJoinDone()
+                  )
+              );
+            }
+          });
+
+      for (RelDistribution leftDistr : distributions) {
+        for (RelDistribution rightDistr : distributions) {
+          nodes.add(
+              copy(
+                  traitSet.replace(leftDistr),
+                  condition,
+                  left.copy(left.getTraitSet().replace(leftDistr), left.getInputs()),
+                  right.copy(right.getTraitSet().replace(rightDistr), right.getInputs()),
+                  JoinRelType.INNER,
+                  isSemiJoinDone()
+              )
+          );
+        }
+      }
+
+      return nodes;
+    }
+  }
+
+  static class MyMergeJoinRule extends ConverterRule {
+    protected MyMergeJoinRule(Config config) {
+      super(config);
+    }
+
+    @Override public RelNode convert(RelNode rel) {
+      final Join join = (Join) rel;
+      return new MyMergeJoin(
+          rel.getCluster(),
+          rel.getTraitSet().replace(MyConvention.INSTANCE).replace(RelCollations.of(0)),
+          join.getLeft(),
+          join.getRight(),
+          join.getCondition()
+      );
+    }
+  }
+
+  static class MyProject extends Project implements MyPhysNode {
+
+    protected MyProject(RelOptCluster cluster, RelTraitSet traits, List<RelHint> hints,
+        RelNode input, List<? extends RexNode> projects, RelDataType rowType) {
+      super(cluster, traits, hints, input, projects, rowType);
+    }
+
+    @Override public Project copy(RelTraitSet traitSet, RelNode input, List<RexNode> projects,
+        RelDataType rowType) {
+      return new MyProject(getCluster(), traitSet, getHints(), input, projects, getRowType());
+    }
+  }
+
+  static class MyProjectRule extends ConverterRule {
+    /** Default configuration. */
+    static final MyProjectRule INSTANCE = Config.EMPTY
+        .as(Config.class)
+        .withConversion(LogicalProject.class, p -> !p.containsOver(),
+            Convention.NONE, MyConvention.INSTANCE,
+            "MyProjectRule")
+        .withRuleFactory(MyProjectRule::new)
+        .toRule(MyProjectRule.class);
+
+    /** Creates an EnumerableProjectRule. */
+    protected MyProjectRule(Config config) {
+      super(config);
+    }
+
+    @Override public RelNode convert(RelNode rel) {
+      final Project project = (Project) rel;
+
+      return new MyProject(
+          project.getCluster(),
+          project.getCluster().traitSetOf(MyConvention.INSTANCE),
+          project.getHints(),
+          project.getInput(),
+          project.getProjects(),
+          project.getRowType()
+      );
+    }
+  }
+
+  static class MyTableScan extends TableScan implements MyPhysNode {
+
+    protected MyTableScan(RelOptCluster cluster, RelTraitSet traitSet,
+        List<RelHint> hints, RelOptTable table) {
+      super(cluster, traitSet, hints, table);
+    }
+
+    @Override
+    public @Nullable Pair<RelTraitSet, List<RelTraitSet>> passThroughTraits(RelTraitSet required) {
+      return null;
+    }
+  }
+
+  static class MyTableScanRule extends ConverterRule {
+    /** Default configuration. */
+    static final MyTableScanRule INSTANCE = Config.EMPTY
+        .as(Config.class)
+        .withConversion(LogicalTableScan.class, Convention.NONE, MyConvention.INSTANCE,
+            "MyTableScanRule")
+        .withRuleFactory(MyTableScanRule::new)
+        .toRule(MyTableScanRule.class);
+
+    /** Creates an EnumerableProjectRule. */
+    protected MyTableScanRule(Config config) {
+      super(config);
+    }
+
+    @Override public RelNode convert(RelNode rel) {
+      final TableScan scan = (TableScan) rel;
+      return new MyTableScan(
+          scan.getCluster(),
+          scan.getCluster().traitSetOf(MyConvention.INSTANCE)
+              .replace(RelDistributions.hash(ImmutableSet.of(0)))
+              .replace(RelCollations.of(0)),
+          scan.getHints(),
+          scan.getTable()
+      );
+    }
+  }
+
+  static class MyExchange extends Exchange implements MyPhysNode {
+
+    protected MyExchange(RelOptCluster cluster, RelTraitSet traitSet, RelNode input,
+        RelDistribution distribution) {
+      super(cluster, traitSet, input, distribution);
+    }
+
+    @Override
+    public Exchange copy(RelTraitSet traitSet, RelNode newInput, RelDistribution newDistribution) {
+      return new MyExchange(getCluster(), traitSet, newInput, newDistribution);
+    }
+
+    @Override
+    public @Nullable Pair<RelTraitSet, List<RelTraitSet>> passThroughTraits(RelTraitSet required) {
+      return null;
+    }
+
+    @Override public List<RelNode> derive(List<List<RelTraitSet>> inputTraits) {
+      return Collections.emptyList();
+    }
+  }
+
+  @Test void test() throws Exception {
+    System.setProperty("calcite.planner.topdown.opt", "true");
+
+    ConverterRule.Config myFilterConfigTemplate = ConverterRule.Config.EMPTY
+        .as(ConverterRule.Config.class)
+        .withConversion(LogicalJoin.class, Convention.NONE,
+            MyConvention.INSTANCE,
+            "JoinRule");
+
+    RuleSet ruleSet =
+        RuleSets.ofList(
+            CoreRules.FILTER_MERGE,
+            MyTableScanRule.INSTANCE,
+            myFilterConfigTemplate
+                .withRuleFactory(MyNLJoinRule::new)
+                .withDescription("MyNLJoinRule")
+                .toRule(),
+            myFilterConfigTemplate
+                .withRuleFactory(MyMergeJoinRule::new)
+                .withDescription("MyMergeJoinRule")
+                .toRule(),
+            MyProjectRule.INSTANCE);
+
+    final List<RelTraitDef> traitDefs = Arrays.asList(
+        ConventionTraitDef.INSTANCE,
+        RelDistributionTraitDef.INSTANCE,
+        RelCollationTraitDef.INSTANCE
+    );
+
+    Planner planner = getPlanner(traitDefs, Programs.of(ruleSet));
+
+    SqlNode parse = planner.parse(
+        "select e1.\"empid\", e1.\"deptno\" from \"emps\" e1 join \"emps\" e2 on e1.\"empid\" = e2.\"empid\"");
+    SqlNode validate = planner.validate(parse);
+    RelNode convert = planner.rel(validate).project();
+    RelTraitSet traitSet = convert.getTraitSet()
+        .replace(MyConvention.INSTANCE)
+        .replace(RelDistributions.SINGLETON);
+
+    deriveCalled.set(false);
+
+    RelNode result = planner.transform(0, traitSet, convert);
+
+    System.out.println(RelOptUtil.toString(result));
+
+    assertTrue(deriveCalled.get());
   }
 
   /** Unit test that calls {@link Planner#transform} twice. */
