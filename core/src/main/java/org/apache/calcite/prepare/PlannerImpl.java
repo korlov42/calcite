@@ -64,7 +64,9 @@ import com.google.common.collect.ImmutableList;
 import org.checkerframework.checker.nullness.qual.EnsuresNonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
+import java.io.PrintWriter;
 import java.io.Reader;
+import java.io.StringWriter;
 import java.util.List;
 
 import static java.util.Objects.requireNonNull;
@@ -136,6 +138,15 @@ public class PlannerImpl implements Planner, ViewExpander {
           String.valueOf(parserConfig.conformance()));
     }
     return config;
+  }
+
+  /** */
+  public String dump() {
+    StringWriter w = new StringWriter();
+
+    ((VolcanoPlanner)planner).dump(new PrintWriter(w));
+
+    return w.toString();
   }
 
   /** Makes sure that the state is at least the given state. */

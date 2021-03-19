@@ -30,6 +30,7 @@ import org.apache.calcite.plan.Convention;
 import org.apache.calcite.plan.ConventionTraitDef;
 import org.apache.calcite.plan.DeriveMode;
 import org.apache.calcite.plan.RelOptCluster;
+import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.RelOptPredicateList;
 import org.apache.calcite.plan.RelOptRule;
@@ -39,6 +40,7 @@ import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelRule;
 import org.apache.calcite.plan.RelTraitDef;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.prepare.PlannerImpl;
 import org.apache.calcite.rel.PhysicalNode;
 import org.apache.calcite.rel.RelCollationTraitDef;
 import org.apache.calcite.rel.RelCollations;
@@ -925,6 +927,17 @@ class PlannerTest {
 
       return nodes;
     }
+
+    @Override public @Nullable RelOptCost computeSelfCost(RelOptPlanner planner,
+        RelMetadataQuery mq) {
+      RelDistribution distr = getTraitSet().getDistribution();
+
+      if (distr == RelDistributions.ANY)
+        return planner.getCostFactory().makeInfiniteCost();
+
+      return super.computeSelfCost(planner, mq)
+          .multiplyBy(distr == RelDistributions.SINGLETON ? 1000 : 1);
+    }
   }
 
   static class MyNLJoinRule extends ConverterRule {
@@ -955,9 +968,6 @@ class PlannerTest {
 
     @Override public List<RelNode> derive(List<List<RelTraitSet>> inputTraits) {
       deriveCalled.set(true);
-
-      List<RelDistribution> distributions = Arrays.asList(RelDistributions.SINGLETON,
-          RelDistributions.BROADCAST_DISTRIBUTED, RelDistributions.hash(ImmutableSet.of(0)));
 
       List<RelNode> nodes = new ArrayList<>();
 
@@ -1005,22 +1015,17 @@ class PlannerTest {
             }
           });
 
-      for (RelDistribution leftDistr : distributions) {
-        for (RelDistribution rightDistr : distributions) {
-          nodes.add(
-              copy(
-                  traitSet.replace(leftDistr),
-                  condition,
-                  left.copy(left.getTraitSet().replace(leftDistr), left.getInputs()),
-                  right.copy(right.getTraitSet().replace(rightDistr), right.getInputs()),
-                  JoinRelType.INNER,
-                  isSemiJoinDone()
-              )
-          );
-        }
-      }
-
       return nodes;
+    }
+
+    @Override public @Nullable RelOptCost computeSelfCost(RelOptPlanner planner,
+        RelMetadataQuery mq) {
+      RelDistribution distr = getTraitSet().getDistribution();
+
+      if (distr == RelDistributions.ANY)
+        return planner.getCostFactory().makeInfiniteCost();
+
+      return super.computeSelfCost(planner, mq).multiplyBy(0.000001);
     }
   }
 
@@ -1188,7 +1193,7 @@ class PlannerTest {
 
     RelNode result = planner.transform(0, traitSet, convert);
 
-    System.out.println(RelOptUtil.toString(result));
+    System.out.println(((PlannerImpl)planner).dump());
 
     assertTrue(deriveCalled.get());
   }
