@@ -966,6 +966,11 @@ class PlannerTest {
       super(cluster, traits, left, right, condition);
     }
 
+    @Override public Join copy(RelTraitSet traitSet, RexNode conditionExpr, RelNode left, RelNode right,
+        JoinRelType joinType, boolean semiJoinDone) {
+      return new MyMergeJoin(getCluster(), traitSet, left, right, condition);
+    }
+
     @Override public List<RelNode> derive(List<List<RelTraitSet>> inputTraits) {
       deriveCalled.set(true);
 
@@ -1025,7 +1030,7 @@ class PlannerTest {
       if (distr == RelDistributions.ANY)
         return planner.getCostFactory().makeInfiniteCost();
 
-      return super.computeSelfCost(planner, mq).multiplyBy(0.000001);
+      return super.computeSelfCost(planner, mq).multiplyBy(0.0001);
     }
   }
 
@@ -1147,6 +1152,14 @@ class PlannerTest {
 
     @Override public List<RelNode> derive(List<List<RelTraitSet>> inputTraits) {
       return Collections.emptyList();
+    }
+
+    @Override
+    public @Nullable RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
+      double rowCount = 100;
+      double bytesPerRow = getRowType().getFieldCount() * 4;
+      return planner.getCostFactory().makeCost(
+          Util.nLogN(rowCount) * bytesPerRow, rowCount, 0);
     }
   }
 
